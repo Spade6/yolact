@@ -248,4 +248,7 @@ For questions about our paper or code, please contact [Daniel Bolya](mailto:dbol
 python eval.py --trained_model=weights/yolact_resnet50_54_800000.pth --score_threshold=0.15 --top_k=15 --video_multiframe=1 --video=0 --only_human --display_bboxes=False --display_text=False --display_scores=False --mask_mp4
 ```
 
-
+# Masking human blur
+```
+python eval.py --trained_model=weights/yolact_resnet50_54_800000.pth --score_threshold=0.15 --top_k=15 --video_multiframe=1 --video=0 --only_human --display_bboxes=False --display_text=False --display_scores=False --mask_human
+```

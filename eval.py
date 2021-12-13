@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
+from torchvision import transforms
 import argparse
 import time
 import random
@@ -117,6 +118,8 @@ def parse_args(argv=None):
                         help='mask only human')
     parser.add_argument('--mask_mp4', default=False, dest='mask_mp4', action='store_true',
                         help='mask mp4 video')
+    parser.add_argument('--mask_human', default=False, dest='mask_human', action='store_true',
+                        help='mask human on webcam')
 
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
                         benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False, display_fps=False,
@@ -193,15 +196,19 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     # I wish I had access to OpenGL or Vulkan but alas, I guess Pytorch tensor operations will have to suffice
     
     if args.display_masks and cfg.eval_mask_branch and num_dets_to_consider > 0:
-        check_human = False
+        total_human = 0
         for j in range(num_dets_to_consider):
             if classes[j] == 0:
-                check_human = True
-                break
+                total_human += 1
         # print only human
-        if check_human and args.only_human:
+        if total_human > 0 and args.only_human:
+            og_img_gpu = img_gpu.clone()
             # After this, mask is of size [num_dets, h, w, 1]
-            masks = masks[:1, :, :, None]
+            total_human = 0
+            for j in range(num_dets_to_consider):
+                if classes[j] == 0:
+                    total_human += 1
+            masks = masks[:total_human, :, :, None]
             
             # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
             colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider) if classes[j] == 0], dim=0)
@@ -214,14 +221,14 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
             #    for j in range(num_dets_to_consider):
             #        img_gpu = img_gpu * inv_alph_masks[j] + masks_color[j]
             
-            masks_color_summand = masks_color[0]
-            # if num_dets_to_consider > 1:
-            #     inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
-            #     masks_color_cumul = masks_color[1:] * inv_alph_cumul
-            #     masks_color_summand += masks_color_cumul.sum(dim=0)
+            if total_human > 1:
+                masks_color_summand = masks_color.max(dim=0)[0]
+            else:
+                masks_color_summand = masks_color[0]
 
-            img_gpu = masks_color_summand #img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
-        elif not args.only_human:
+            img_gpu = masks_color_summand
+        
+        elif not args.only_human and not args.mask_human:
             # After this, mask is of size [num_dets, h, w, 1]
             masks = masks[:num_dets_to_consider, :, :, None]
             
@@ -242,7 +249,13 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
                 masks_color_summand += masks_color_cumul.sum(dim=0)
 
             img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
-
+        
+        if total_human > 0 and args.only_human and args.mask_human:
+            # og_img_gpu # og image
+            # img_gpu # mask
+            masked_image = (og_img_gpu * img_gpu * 255).byte().cpu().numpy() # masked colored image
+            inversed_image = og_img_gpu * -(img_gpu - 1.0)
+            img_gpu = inversed_image
     if args.display_fps:
             # Draw the box for the fps on the GPU
         font_face = cv2.FONT_HERSHEY_DUPLEX
@@ -267,7 +280,7 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
     
     if num_dets_to_consider == 0 and not args.mask_mp4:
         return img_numpy
-    elif (num_dets_to_consider == 0 and args.mask_mp4) or (not check_human and args.mask_mp4):
+    elif (num_dets_to_consider == 0 and args.mask_mp4) or (total_human == 0 and args.mask_mp4):
         return np.zeros([720,1280,3])
 
     if args.display_text or args.display_bboxes:
@@ -303,6 +316,12 @@ def prep_display(dets_out, img, h, w, undo_transform=True, class_color=False, ma
         img_numpy = cv2.resize(img_numpy, dsize=(1280, 720), interpolation=cv2.INTER_AREA)
         img_numpy = cv2.bitwise_and(frame, img_numpy)
     
+    if total_human > 0 and args.only_human and args.mask_human:
+        if masked_image is not None:
+            dst = cv2.GaussianBlur(masked_image, (0, 0), 9)
+            dst = cv2.erode(dst, (9,9), iterations=3)
+            img_numpy = cv2.add(img_numpy, dst)
+
     return img_numpy
 
 def prep_benchmark(dets_out, h, w):
@@ -686,14 +705,14 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     
     if is_webcam:
         vid = cv2.VideoCapture(int(path))
+        vid.set(3, 1280)
+        vid.set(4, 720)
     else:
         vid = cv2.VideoCapture(path)
     
     global cap
     if args.mask_mp4:
-        cap = cv2.VideoCapture('numbers.mov')#("10-random.mp4")
-        # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
-        # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)  
+        cap = cv2.VideoCapture('numbers.mov')
         if not cap.isOpened():
             print('Could not open masking video')
             exit(-1)
@@ -705,6 +724,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     target_fps   = round(vid.get(cv2.CAP_PROP_FPS))
     frame_width  = round(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = round(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print("frame_width: ", frame_width)
     
     if is_webcam:
         num_frames = float('inf')
@@ -732,15 +752,12 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
             out.release()
         cv2.destroyAllWindows()
         exit()
-
-    def get_next_mask_frame(vid):
-        frame = vid.read()[1]
-        return frame
         
     def get_next_frame(vid):
         frames = []
         for idx in range(args.video_multiframe):
             frame = vid.read()[1]
+            print(frame.shape)
             if frame is None:
                 return frames
             frames.append(frame)
@@ -882,7 +899,7 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
                     if frame['idx'] == 0:
                         _args.append(fps_str)
                     frame['value'] = pool.apply_async(sequence[frame['idx']], args=_args)
-                
+                    
                 # For each frame whose job was the last in the sequence (i.e. for all final outputs)
                 for frame in active_frames:
                     if frame['idx'] == 0:
