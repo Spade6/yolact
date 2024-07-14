@@ -30,6 +30,13 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import cv2
 
+from flask import Flask
+from flask import request
+from flask import Response
+from flask import stream_with_context
+import base64
+from threading import Thread
+
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
@@ -120,6 +127,8 @@ def parse_args(argv=None):
                         help='mask mp4 video')
     parser.add_argument('--mask_human', default=False, dest='mask_human', action='store_true',
                         help='mask human on webcam')
+    parser.add_argument('--streaming', default=False, dest='streaming', action='store_true',
+                        help='output streaming to web')
 
     parser.set_defaults(no_bar=False, display=False, resume=False, output_coco_json=False, output_web_json=False, shuffle=False,
                         benchmark=False, no_sort=False, no_hash=False, mask_proto_debug=False, crop=True, detect=False, display_fps=False,
@@ -785,13 +794,14 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
             frame, preds = inp
             return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str)
 
+    global frame_buffer
     frame_buffer = Queue()
     video_fps = 0
 
     # All this timing code to make sure that 
     def play_video():
         try:
-            nonlocal frame_buffer, running, video_fps, is_webcam, num_frames, frames_displayed, vid_done
+            nonlocal running, video_fps, is_webcam, num_frames, frames_displayed, vid_done
 
             video_frame_times = MovingAverage(100)
             frame_time_stabilizer = frame_time_target
@@ -809,6 +819,8 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
                         video_fps = 1 / video_frame_times.get_avg()
                     if out_path is None:
                         cv2.imshow(path, frame_buffer.get())
+                    elif args.streaming:
+                        pass
                     else:
                         out.write(frame_buffer.get())
                     frames_displayed += 1
@@ -941,6 +953,268 @@ def evalvideo(net:Yolact, path:str, out_path:str=None):
     
     cleanup_and_exit()
 
+class EvalVideo():
+    def __init__(self, net:Yolact, path:str, out_path:str=None):
+        # If the path is a digit, parse it as a webcam index
+        self.is_webcam = path.isdigit()
+        
+        # If the input image size is constant, this make things faster (hence why we can use it in a video setting).
+        cudnn.benchmark = True
+        
+        if self.is_webcam:
+            self.vid = cv2.VideoCapture(int(path))
+            self.vid.set(3, 1920)
+            self.vid.set(4, 1080)
+        else:
+            self.vid = cv2.VideoCapture(path)
+        
+        global cap
+        if args.mask_mp4:
+            cap = cv2.VideoCapture('numbers.mov')
+            if not cap.isOpened():
+                print('Could not open masking video')
+                exit(-1)
+        
+        if not self.vid.isOpened():
+            print('Could not open video "%s"' % path)
+            exit(-1)
+
+        self.target_fps   = round(self.vid.get(cv2.CAP_PROP_FPS))
+        self.frame_width  = round(self.vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = round(self.vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        print("frame_width: ", self.frame_width)
+        
+        if self.is_webcam:
+            self.num_frames = float('inf')
+        else:
+            self.num_frames = round(vid.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        self.net = CustomDataParallel(net).cuda()
+        self.transform = torch.nn.DataParallel(FastBaseTransform()).cuda()
+        self.frame_times = MovingAverage(100)
+        self.fps = 0
+        self.frame_time_target = 1 / self.target_fps
+        self.running = True
+        self.fps_str = ''
+        self.vid_done = False
+        self.frames_displayed = 0
+
+        self.path = path
+        self.out_path = out_path
+        if out_path is not None:
+            self.out = cv2.VideoWriter(self.out_path, cv2.VideoWriter_fourcc(*"mp4v"), self.target_fps, (self.frame_width, self.frame_height))
+
+        self.frame_buffer = Queue()
+        self.video_fps = 0
+
+        self.thread = None
+
+    def cleanup_and_exit(self):
+        print()
+        self.pool.terminate()
+        self.vid.release()
+        if self.out_path is not None:
+            self.out.release()
+        cv2.destroyAllWindows()
+        exit()
+        
+    def get_next_frame(self, vid):
+        frames = []
+        for idx in range(args.video_multiframe):
+            frame = vid.read()[1]
+            if frame is None:
+                return frames
+            img = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            img = img[306:-306, 122:-222]
+            frame = cv2.resize(img, (1080, 1920))
+            frames.append(frame)
+        return frames
+
+    def transform_frame(self, frames):
+        with torch.no_grad():
+            frames = [torch.from_numpy(frame).cuda().float() for frame in frames]
+            return frames, self.transform(torch.stack(frames, 0))
+
+    def eval_network(self, inp):
+        with torch.no_grad():
+            frames, imgs = inp
+            num_extra = 0
+            while imgs.size(0) < args.video_multiframe:
+                imgs = torch.cat([imgs, imgs[0].unsqueeze(0)], dim=0)
+                num_extra += 1
+            out = self.net(imgs)
+            if num_extra > 0:
+                out = out[:-num_extra]
+            return frames, out
+
+    def prep_frame(self, inp, fps_str):
+        with torch.no_grad():
+            frame, preds = inp
+            return prep_display(preds, frame, None, None, undo_transform=False, class_color=True, fps_str=fps_str)
+
+    # All this timing code to make sure that 
+    def play_video(self):
+        try:
+            self.video_frame_times = MovingAverage(100)
+            self.frame_time_stabilizer = self.frame_time_target
+            self.last_time = None
+            self.stabilizer_step = 0.0005
+            self.progress_bar = ProgressBar(30, self.num_frames)
+
+            while self.running:
+                self.frame_time_start = time.time()
+
+                if not self.frame_buffer.empty():
+                    self.next_time = time.time()
+                    if self.last_time is not None:
+                        self.video_frame_times.add(self.next_time - self.last_time)
+                        self.video_fps = 1 / self.video_frame_times.get_avg()
+                    if self.out_path is None:
+                        cv2.imshow(self.path, self.frame_buffer.get())
+                    elif args.streaming:
+                        pass
+                    else:
+                        self.out.write(self.frame_buffer.get())
+                    self.frames_displayed += 1
+                    self.last_time = self.next_time
+
+                    if self.out_path is not None:
+                        if self.video_frame_times.get_avg() == 0:
+                            self.fps = 0
+                        else:
+                            self.fps = 1 / self.video_frame_times.get_avg()
+                        self.progress = self.frames_displayed / self.num_frames * 100
+                        self.progress_bar.set_val(self.frames_displayed)
+
+                        print('\rProcessing Frames  %s %6d / %6d (%5.2f%%)    %5.2f fps        '
+                            % (repr(self.progress_bar), self.frames_displayed, self.num_frames, self.progress, self.fps), end='')
+
+                
+                # This is split because you don't want savevideo to require cv2 display functionality (see #197)
+                if self.out_path is None and cv2.waitKey(1) == 27:
+                    # Press Escape to close
+                    self.running = False
+                if not (self.frames_displayed < self.num_frames):
+                    self.running = False
+
+                if not self.vid_done:
+                    self.buffer_size = self.frame_buffer.qsize()
+                    if self.buffer_size < args.video_multiframe:
+                        self.frame_time_stabilizer += self.stabilizer_step
+                    elif self.buffer_size > args.video_multiframe:
+                        self.frame_time_stabilizer -= self.stabilizer_step
+                        if self.frame_time_stabilizer < 0:
+                            self.frame_time_stabilizer = 0
+
+                    self.new_target = self.frame_time_stabilizer if self.is_webcam else max(self.frame_time_stabilizer, self.frame_time_target)
+                else:
+                    self.new_target = self.frame_time_target
+
+                self.next_frame_target = max(2 * self.new_target - self.video_frame_times.get_avg(), 0)
+                self.target_time = self.frame_time_start + self.next_frame_target - 0.001 # Let's just subtract a millisecond to be safe
+                
+                if self.out_path is None or args.emulate_playback:
+                    # This gives more accurate timing than if sleeping the whole amount at once
+                    while time.time() < self.target_time:
+                        time.sleep(0.001)
+                else:
+                    # Let's not starve the main thread, now
+                    time.sleep(0.001)
+        except:
+            # See issue #197 for why this is necessary
+            import traceback
+            traceback.print_exc()
+
+    def run(self):
+        if self.thread is None :
+            self.thread = Thread(target=self._run, args=())
+            self.thread.daemon = False
+            self.thread.start()
+        
+        self.started = True
+
+    def _run(self):
+        self.extract_frame = lambda x, i: (x[0][i] if x[1][i]['detection'] is None else x[0][i].to(x[1][i]['detection']['box'].device), [x[1][i]])
+
+        # Prime the network on the first frame because I do some thread unsafe things otherwise
+        print('Initializing model... ', end='')
+        self.first_batch = self.eval_network(self.transform_frame(self.get_next_frame(self.vid)))
+        print('Done.')
+
+        # For each frame the sequence of functions it needs to go through to be processed (in reversed order)
+        self.sequence = [self.prep_frame, self.eval_network, self.transform_frame]
+        self.pool = ThreadPool(processes=len(self.sequence) + args.video_multiframe + 2)
+        self.pool.apply_async(self.play_video)
+        self.active_frames = [{'value': self.extract_frame(self.first_batch, i), 'idx': 0} for i in range(len(self.first_batch[0]))]
+
+        print()
+        if self.out_path is None: print('Press Escape to close.')
+        try:
+            while self.vid.isOpened() and self.running:
+                # Hard limit on frames in buffer so we don't run out of memory >.>
+                while self.frame_buffer.qsize() > 100:
+                    time.sleep(0.001)
+
+                self.start_time = time.time()
+
+                # Start loading the next frames from the disk
+                if not self.vid_done:
+                    self.next_frames = self.pool.apply_async(self.get_next_frame, args=(self.vid,))
+                else:
+                    self.next_frames = None
+                
+                if not (self.vid_done and len(self.active_frames) == 0):
+                    # For each frame in our active processing queue, dispatch a job
+                    # for that frame using the current function in the sequence
+                    for frame in self.active_frames:
+                        _args =  [frame['value']]
+                        if frame['idx'] == 0:
+                            _args.append(self.fps_str)
+                        frame['value'] = self.pool.apply_async(self.sequence[frame['idx']], args=_args)
+                        
+                    # For each frame whose job was the last in the sequence (i.e. for all final outputs)
+                    for frame in self.active_frames:
+                        if frame['idx'] == 0:
+                            self.frame_buffer.put(frame['value'].get())
+
+                    # Remove the finished frames from the processing queue
+                    self.active_frames = [x for x in self.active_frames if x['idx'] > 0]
+
+                    # Finish evaluating every frame in the processing queue and advanced their position in the sequence
+                    for frame in list(reversed(self.active_frames)):
+                        frame['value'] = frame['value'].get()
+                        frame['idx'] -= 1
+
+                        if frame['idx'] == 0:
+                            # Split this up into individual threads for prep_frame since it doesn't support batch size
+                            self.active_frames += [{'value': self.extract_frame(frame['value'], i), 'idx': 0} for i in range(1, len(frame['value'][0]))]
+                            frame['value'] = self.extract_frame(frame['value'], 0)
+                    
+                    # Finish loading in the next frames and add them to the processing queue
+                    if self.next_frames is not None:
+                        self.frames = self.next_frames.get()
+                        if len(self.frames) == 0:
+                            self.vid_done = True
+                        else:
+                            self.active_frames.append({'value': self.frames, 'idx': len(self.sequence)-1})
+
+                    # Compute FPS
+                    self.frame_times.add(time.time() - self.start_time)
+                    self.fps = args.video_multiframe / self.frame_times.get_avg()
+                else:
+                    self.fps = 0
+                
+                self.fps_str = 'Processing FPS: %.2f | Video Playback FPS: %.2f | Frames in Buffer: %d' % (self.fps, self.video_fps, self.frame_buffer.qsize())
+                if not args.display_fps:
+                    print('\r' + self.fps_str + '    ', end='')
+
+        except KeyboardInterrupt:
+            print('\nStopping...')
+        
+        self.cleanup_and_exit()
+
+eval_V = None 
 def evaluate(net:Yolact, dataset, train_mode=False):
     net.detect.use_fast_nms = args.fast_nms
     net.detect.use_cross_class_nms = args.cross_class_nms
@@ -957,6 +1231,12 @@ def evaluate(net:Yolact, dataset, train_mode=False):
     elif args.images is not None:
         inp, out = args.images.split(':')
         evalimages(net, inp, out)
+        return
+    elif args.streaming:
+        global eval_V
+        eval_V = EvalVideo(net, args.video)
+        # eval_V.run()
+        print("STREAMING START")
         return
     elif args.video is not None:
         if ':' in args.video:
@@ -1117,8 +1397,6 @@ def print_maps(all_maps):
     print(make_sep(len(all_maps['box']) + 1))
     print()
 
-
-
 if __name__ == '__main__':
     parse_args()
 
@@ -1174,7 +1452,46 @@ if __name__ == '__main__':
 
         if args.cuda:
             net = net.cuda()
-
+        
         evaluate(net, dataset)
+
+    if args.streaming:
+        global app
+        app = Flask( __name__ )
+
+        @app.route('/stream')
+        def stream():
+            tt = request.args.get('type', default = 0, type = int )
+            try :
+                return Response(stream_with_context(stream_gen(int(tt))),
+                                mimetype='multipart/x-mixed-replace; boundary=frame' )
+                
+            except Exception as e :
+                print('[Discrete Label] ', 'stream error : ',str(e))
+
+
+        def get_frame():
+            img = eval_V.frame_buffer.get()
+            # img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            # img = img[153:-153, 86:-86]
+            # img = cv2.resize(img, (1080, 1920))
+            return cv2.imencode('.jpg', img)[1].tobytes()
+
+        def stream_gen(tt=0):
+            try :
+                eval_V.run()
+                while True :
+                    frame = get_frame()
+                    
+                    yield (b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                            
+            except GeneratorExit:
+                print('[Discrete Label]', 'disconnected stream')
+                # streamer.stop()
+        app.run(host='0.0.0.0', port=5001)
+
+        # when app closed
+        # streamer.stop()
 
 
